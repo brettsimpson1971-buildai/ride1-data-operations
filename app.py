@@ -11,13 +11,13 @@ def get_conn():
 st.set_page_config(page_title="RIDE 1 DATA OPERATIONS", layout="wide")
 
 # Sidebar Navigation
-st.sidebar.image("https://ride1dashboard-x46xojtyqjqte9xoql5xbj.streamlit.app/~/+/media/70888888888888888888888888888888888888888888888888888888.png", width=200)
+st.sidebar.title("RIDE 1 OPS")
 operation = st.sidebar.radio("Select Operation:", ["Upload Inventory", "Upload Activity Log", "View Database Stats", "NUKE"])
 
 # --- OPERATION 1: UPLOAD MASTER INVENTORY ---
 if operation == "Upload Inventory":
     st.header("📦 Upload Master Inventory")
-    st.info("Use this for the initial 1M+ SKU Master List.")
+    st.info("Use this for the initial 1M+ SKU Master List. This WIPES the current inventory table.")
     uploaded_file = st.file_uploader("Choose Master Inventory CSV", type="csv")
     
     if uploaded_file:
@@ -62,15 +62,12 @@ if operation == "Upload Inventory":
 # --- OPERATION 2: UPLOAD ACTIVITY LOG (THE FORENSIC DATA) ---
 elif operation == "Upload Activity Log":
     st.header("🕵️ Upload Daily Activity Log")
-    st.info("Use this for daily DMS exports or Forensic Demo files.")
+    st.info("Use this for daily DMS exports or Forensic Demo files. This ADDS to the log, it does not wipe it.")
     uploaded_file = st.file_uploader("Choose Activity Log CSV", type="csv")
     
     if uploaded_file:
         df_preview = pd.read_csv(uploaded_file, nrows=5)
         st.write("Preview:", df_preview)
-        
-        # Auto-mapping for the forensic columns
-        cols = df_preview.columns.tolist()
         
         if st.button("🔍 IMPORT ACTIVITY LOG"):
             try:
@@ -78,12 +75,11 @@ elif operation == "Upload Activity Log":
                 cur = conn.cursor()
                 
                 uploaded_file.seek(0)
-                # Activity logs are usually smaller, but we still use chunks for safety
                 reader = pd.read_csv(uploaded_file, chunksize=10000)
                 
                 total_rows = 0
                 for chunk in reader:
-                    # Ensure column names match the CSV I generated for you
+                    # We map the columns exactly as they appear in the forensic_onboarding_demo.csv
                     data_to_insert = chunk[['part_number', 'description', 'quantity', 'employee_id', 'movement_type', 'location_bin', 'variance_amount', 'severity_level', 'timestamp']].values.tolist()
                     
                     execute_values(cur, """
@@ -95,6 +91,7 @@ elif operation == "Upload Activity Log":
                     total_rows += len(chunk)
                 
                 st.success(f"Successfully imported {total_rows} activity records.")
+                st.balloons()
                 cur.close()
                 conn.close()
             except Exception as e:
@@ -109,6 +106,11 @@ elif operation == "View Database Stats":
         log_count = pd.read_sql("SELECT count(*) FROM receiving_log", conn).iloc[0,0]
         st.metric("Master Inventory SKUs", f"{inv_count:,}")
         st.metric("Activity Log Records", f"{log_count:,}")
+        
+        st.subheader("Latest 10 Activity Records")
+        latest_logs = pd.read_sql("SELECT * FROM receiving_log ORDER BY timestamp DESC LIMIT 10", conn)
+        st.table(latest_logs)
+        
         conn.close()
     except Exception as e:
         st.error(f"Error: {e}")
