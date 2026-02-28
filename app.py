@@ -3,7 +3,7 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 
-st.set_page_config(page_title="ZAPTASK A.I. | DATA OPERATIONS", layout="wide")
+st.set_page_config(page_title="RIDE 1 | DATA OPERATIONS", layout="wide")
 
 if "password_correct" not in st.session_state:
     st.session_state["password_correct"] = False
@@ -25,16 +25,23 @@ if check_password():
     def get_conn():
         return psycopg2.connect(st.secrets["postgres"]["url"])
 
-    # Sidebar with LOGO
-    st.sidebar.image("https://raw.githubusercontent.com/brettsimpson1971/ride1-dashboard/main/logo.png", width=200)
+    # RAW LOGO URL
+    LOGO_URL = "https://raw.githubusercontent.com/brettsimpson1971-buildai/ride1dashboard/main/Screenshot%202026-02-28%20164500.png"
+
+    # Sidebar
+    st.sidebar.image(LOGO_URL, use_container_width=True)
     st.sidebar.title("DATA OPERATIONS")
     if st.sidebar.button("🔒 LOGOUT"):
         st.session_state["password_correct"] = False
         st.rerun()
 
     operation = st.sidebar.radio("Select Operation:", ["Upload Activity Log", "Upload Master Inventory", "NUKE"])
-    st.header(f"📦 {operation}")
     
+    # Header (Restoring your professional layout)
+    st.title("RIDE 1: DATA OPERATIONS CENTER")
+    st.divider()
+    
+    st.header(f"📦 {operation}")
     uploaded_file = st.file_uploader("Choose CSV File", type="csv")
     
     if uploaded_file:
@@ -42,35 +49,20 @@ if check_password():
             try:
                 conn = get_conn()
                 cur = conn.cursor()
-                
                 if operation == "Upload Master Inventory":
                     cur.execute("TRUNCATE TABLE inventory;")
                     conn.commit()
                 
-                # Process in chunks
                 reader = pd.read_csv(uploaded_file, chunksize=10000)
-                total_rows = 0
                 for chunk in reader:
-                    # Fill empty values to prevent SQL errors
                     chunk = chunk.fillna("")
                     data = chunk.values.tolist()
-                    
                     if operation == "Upload Master Inventory":
-                        execute_values(cur, """
-                            INSERT INTO inventory (part_number, quantity_on_hand, location_bin) 
-                            VALUES %s 
-                            ON CONFLICT (part_number) DO UPDATE SET quantity_on_hand = EXCLUDED.quantity_on_hand
-                        """, data)
+                        execute_values(cur, "INSERT INTO inventory (part_number, quantity_on_hand, location_bin) VALUES %s ON CONFLICT (part_number) DO UPDATE SET quantity_on_hand = EXCLUDED.quantity_on_hand", data)
                     else:
-                        execute_values(cur, """
-                            INSERT INTO receiving_log 
-                            (part_number, description, quantity, employee_id, movement_type, location_bin, variance_amount, severity_level, timestamp) 
-                            VALUES %s
-                        """, data)
+                        execute_values(cur, "INSERT INTO receiving_log (part_number, description, quantity, employee_id, movement_type, location_bin, variance_amount, severity_level, timestamp) VALUES %s", data)
                     conn.commit()
-                    total_rows += len(chunk)
-                
-                st.success(f"✅ Import Complete! {total_rows} rows are now live.")
+                st.success("✅ Import Complete! Data is now live in the Command Center.")
                 conn.close()
             except Exception as e:
                 st.error(f"Upload Error: {e}")
