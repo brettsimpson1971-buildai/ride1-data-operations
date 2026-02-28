@@ -11,14 +11,15 @@ def check_password():
     """Returns True if the user had the correct password."""
     def password_entered():
         """Checks whether a password entered by the user is correct."""
-        if st.session_state["password"] == "RIDE1-ADMIN":
+        # CHANGED PASSWORD TO: ZAPTASK-RIDE1
+        if st.session_state["password"] == "ZAPTASK-RIDE1":
             st.session_state["password_correct"] = True
             del st.session_state["password"]  # don't store password
         else:
             st.session_state["password_correct"] = False
 
-    if "password_correct" not in st.session_state:
-        # First run, show input for password.
+    if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
+        # Show input for password.
         st.title("🔐 ZAPTASK A.I. SECURE GATEWAY")
         st.text_input(
             "Enter Admin Password to Access Ride 1 Operations:", 
@@ -26,18 +27,10 @@ def check_password():
             on_change=password_entered, 
             key="password"
         )
+        if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+            st.error("❌ Invalid Password. Access Denied.")
+        
         st.info("Unauthorized access is strictly prohibited and monitored.")
-        return False
-    elif not st.session_state["password_correct"]:
-        # Password incorrect, show input + error.
-        st.title("🔐 ZAPTASK A.I. SECURE GATEWAY")
-        st.text_input(
-            "Enter Admin Password to Access Ride 1 Operations:", 
-            type="password", 
-            on_change=password_entered, 
-            key="password"
-        )
-        st.error("❌ Invalid Password. Access Denied.")
         return False
     else:
         # Password correct.
@@ -52,6 +45,12 @@ if check_password():
     # Sidebar Navigation
     st.sidebar.image("https://raw.githubusercontent.com/brettsimpson1971/ride1-dashboard/main/logo.png", width=200)
     st.sidebar.title("ZAPTASK A.I. OPS")
+    
+    # ADDED LOGOUT BUTTON
+    if st.sidebar.button("🔒 LOGOUT"):
+        st.session_state["password_correct"] = False
+        st.rerun()
+
     operation = st.sidebar.radio(
         "Select Operation:",
         ["Upload Inventory", "Upload Activity Log", "View Inventory", "NUKE"]
