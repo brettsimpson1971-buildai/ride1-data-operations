@@ -23,7 +23,7 @@ operation = st.sidebar.radio(
 
 if operation == "Upload Inventory":
     st.header("📦 Upload Inventory")
-    st.info("Use this for the initial or refreshed master inventory upload. This wipes the inventory table first.")
+    st.info("Use this for the initial or refreshed master inventory upload. This handles duplicates automatically.")
 
     uploaded_file = st.file_uploader("Choose Inventory CSV", type="csv")
 
@@ -41,6 +41,9 @@ if operation == "Upload Inventory":
             try:
                 conn = get_conn()
                 cur = conn.cursor()
+                
+                # We still truncate for a clean slate, but the UPSERT handles any duplicates within the file itself
+                st.warning("Wiping existing inventory...")
                 cur.execute("TRUNCATE TABLE inventory;")
                 conn.commit()
 
@@ -48,11 +51,26 @@ if operation == "Upload Inventory":
                 reader = pd.read_csv(uploaded_file, chunksize=50000)
 
                 total_rows = 0
-                for chunk in reader:
+                status_text = st.empty()
+                progress_bar = st.progress(0)
+
+                for i, chunk in enumerate(reader):
                     data_to_insert = chunk[[part_col, qty_col, bin_col]].values.tolist()
-                    execute_values(cur, "INSERT INTO inventory (part_number, quantity_on_hand, location_bin) VALUES %s", data_to_insert)
+                    
+                    # THE FIX: ON CONFLICT DO UPDATE
+                    execute_values(cur, """
+                        INSERT INTO inventory (part_number, quantity_on_hand, location_bin) 
+                        VALUES %s
+                        ON CONFLICT (part_number) 
+                        DO UPDATE SET 
+                            quantity_on_hand = EXCLUDED.quantity_on_hand,
+                            location_bin = EXCLUDED.location_bin;
+                    """, data_to_insert)
+                    
                     conn.commit()
                     total_rows += len(chunk)
+                    status_text.markdown(f"### ✅ Committed {total_rows:,} rows...")
+                    progress_bar.progress(min(total_rows / 2000000, 1.0))
                 
                 st.success(f"Done! {total_rows:,} inventory rows imported.")
                 st.balloons()
@@ -61,7 +79,7 @@ if operation == "Upload Inventory":
             except Exception as e:
                 st.error(f"Stream Failure: {e}")
 
-# ---------- OPERATION 2: UPLOAD ACTIVITY LOG (NEW) ----------
+# ---------- OPERATION 2: UPLOAD ACTIVITY LOG ----------
 
 elif operation == "Upload Activity Log":
     st.header("🕵️ Upload Daily Activity Log")
@@ -79,11 +97,12 @@ elif operation == "Upload Activity Log":
                 cur = conn.cursor()
                 
                 uploaded_file.seek(0)
-                # We use the exact columns from the forensic_onboarding_demo.csv
                 cols_to_use = ['part_number', 'description', 'quantity', 'employee_id', 'movement_type', 'location_bin', 'variance_amount', 'severity_level', 'timestamp']
                 
                 reader = pd.read_csv(uploaded_file, chunksize=10000)
                 total_rows = 0
+                status_text = st.empty()
+
                 for chunk in reader:
                     data_to_insert = chunk[cols_to_use].values.tolist()
                     execute_values(cur, """
@@ -93,6 +112,7 @@ elif operation == "Upload Activity Log":
                     """, data_to_insert)
                     conn.commit()
                     total_rows += len(chunk)
+                    status_text.markdown(f"### 🔍 Logged {total_rows:,} activity records...")
                 
                 st.success(f"Successfully imported {total_rows} activity records.")
                 st.balloons()
@@ -110,8 +130,9 @@ elif operation == "View Inventory":
         total_rows = pd.read_sql("SELECT COUNT(*) FROM inventory;", conn).iloc[0, 0]
         total_logs = pd.read_sql("SELECT COUNT(*) FROM receiving_log;", conn).iloc[0, 0]
         
-        st.metric("Total Inventory Rows", f"{total_rows:,}")
-        st.metric("Total Activity Log Rows", f"{total_logs:,}")
+        col1, col2 = st.columns(2)
+        col1.metric("Total Inventory Rows", f"{total_rows:,}")
+        col2.metric("Total Activity Log Rows", f"{total_logs:,}")
         
         st.subheader("Latest 50 Activity Records")
         df_logs = pd.read_sql("SELECT * FROM receiving_log ORDER BY timestamp DESC LIMIT 50;", conn)
