@@ -1,12 +1,10 @@
 import streamlit as st
 import pandas as pd
 import psycopg2
-from datetime import datetime
+from psycopg2.extras import execute_values
 
-# ---------- CONFIG ----------
-st.set_page_config(page_title="ZAPTASK A.I. | COMMAND CENTER", layout="wide")
+st.set_page_config(page_title="ZAPTASK A.I. | DATA OPERATIONS", layout="wide")
 
-# ---------- PERSISTENT LOGIN ----------
 if "password_correct" not in st.session_state:
     st.session_state["password_correct"] = False
 
@@ -29,55 +27,50 @@ if check_password():
 
     # Sidebar with LOGO
     st.sidebar.image("https://raw.githubusercontent.com/brettsimpson1971/ride1-dashboard/main/logo.png", width=200)
-    st.sidebar.title("COMMAND CENTER")
+    st.sidebar.title("DATA OPERATIONS")
     if st.sidebar.button("🔒 LOGOUT"):
         st.session_state["password_correct"] = False
         st.rerun()
+
+    operation = st.sidebar.radio("Select Operation:", ["Upload Activity Log", "Upload Master Inventory", "NUKE"])
+    st.header(f"📦 {operation}")
     
-    if st.sidebar.button("🔄 SYNC LATEST DATA"):
-        st.cache_data.clear()
-        st.rerun()
-
-    try:
-        conn = get_conn()
-        
-        # Metrics
-        inv_stats = pd.read_sql("SELECT COUNT(*) as total_skus, SUM(quantity_on_hand) as total_parts, SUM(quantity_on_hand * 25) as est_value FROM inventory", conn)
-        
-        # Leak Query - Looking for UNRESOLVED leaks
-        leaks_df = pd.read_sql("""
-            SELECT * FROM receiving_log 
-            WHERE resolution_status IS NULL OR resolution_status = 'Unresolved'
-            ORDER BY timestamp DESC
-        """, conn)
-        
-        st.title("Forensic Audit & Loss Prevention")
-        st.divider()
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("TOTAL PARTS", f"{int(inv_stats['total_parts'][0] or 0):,}", f"{int(inv_stats['total_skus'][0] or 0):,} SKUs")
-        m2.metric("EST. VALUE", f"${(inv_stats['est_value'][0] or 0):,.2f}")
-        m3.metric("ACCESSORIES", f"{int((inv_stats['total_parts'][0] or 0) * 0.4):,}")
-        m4.metric("ACTIVE LEAKS", len(leaks_df), delta_color="inverse")
-
-        st.divider()
-
-        st.subheader("🚨 LEAK DETECTOR: SUSPICIOUS VARIANCE")
-        if not leaks_df.empty:
-            st.dataframe(leaks_df, use_container_width=True)
-            for index, row in leaks_df.iterrows():
-                with st.expander(f"CASE #{row['id']} | {row['part_number']} - {row['description']}"):
-                    st.write(f"**Employee:** {row['employee_id']} | **Movement:** {row['movement_type']} | **Variance:** {row['variance_amount']}")
-                    verdict = st.selectbox("Set Verdict:", ["Unresolved", "Theft", "Error", "Damaged"], key=f"v_{row['id']}")
-                    if st.button("SUBMIT VERDICT", key=f"b_{row['id']}"):
-                        cur = conn.cursor()
-                        cur.execute("UPDATE receiving_log SET resolution_status = %s, resolved_at = NOW() WHERE id = %s", (verdict, row['id']))
-                        conn.commit()
-                        st.success("Verdict Logged.")
-                        st.rerun()
-        else:
-            st.success("✅ No active leaks detected. System is balanced.")
-
-        conn.close()
-    except Exception as e:
-        st.error(f"Dashboard Error: {e}")
+    uploaded_file = st.file_uploader("Choose CSV File", type="csv")
+    
+    if uploaded_file:
+        if st.button("🚀 START IMPORT"):
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                
+                if operation == "Upload Master Inventory":
+                    cur.execute("TRUNCATE TABLE inventory;")
+                    conn.commit()
+                
+                # Process in chunks
+                reader = pd.read_csv(uploaded_file, chunksize=10000)
+                total_rows = 0
+                for chunk in reader:
+                    # Fill empty values to prevent SQL errors
+                    chunk = chunk.fillna("")
+                    data = chunk.values.tolist()
+                    
+                    if operation == "Upload Master Inventory":
+                        execute_values(cur, """
+                            INSERT INTO inventory (part_number, quantity_on_hand, location_bin) 
+                            VALUES %s 
+                            ON CONFLICT (part_number) DO UPDATE SET quantity_on_hand = EXCLUDED.quantity_on_hand
+                        """, data)
+                    else:
+                        execute_values(cur, """
+                            INSERT INTO receiving_log 
+                            (part_number, description, quantity, employee_id, movement_type, location_bin, variance_amount, severity_level, timestamp) 
+                            VALUES %s
+                        """, data)
+                    conn.commit()
+                    total_rows += len(chunk)
+                
+                st.success(f"✅ Import Complete! {total_rows} rows are now live.")
+                conn.close()
+            except Exception as e:
+                st.error(f"Upload Error: {e}")
