@@ -13,7 +13,6 @@ st.set_page_config(page_title="RIDE 1 DATA OPERATIONS", layout="wide")
 # ---------- SIDEBAR & NAV ----------
 
 st.sidebar.title("RIDE 1 DATA OPERATIONS")
-
 operation = st.sidebar.radio(
     "Select Operation:",
     ["Upload Inventory", "Upload Activity Log", "View Inventory", "NUKE"]
@@ -22,8 +21,8 @@ operation = st.sidebar.radio(
 # ---------- OPERATION 1: UPLOAD MASTER INVENTORY ----------
 
 if operation == "Upload Inventory":
-    st.header("📦 Upload Inventory")
-    st.info("Use this for the initial or refreshed master inventory upload. This handles duplicates automatically.")
+    st.header("📦 Upload Master Inventory")
+    st.info("Use this for the initial 1M+ SKU Master List. This handles duplicates automatically.")
 
     uploaded_file = st.file_uploader("Choose Inventory CSV", type="csv")
 
@@ -32,18 +31,16 @@ if operation == "Upload Inventory":
         st.write("Preview of file:", df_preview)
 
         cols = df_preview.columns.tolist()
-
-        part_col = st.selectbox("DB: part_number column", cols, index=cols.index("part_number") if "part_number" in cols else 0)
-        qty_col = st.selectbox("DB: quantity_on_hand column", cols, index=cols.index("quantity_on_hand") if "quantity_on_hand" in cols else 0)
-        bin_col = st.selectbox("DB: location_bin column", cols, index=cols.index("location_bin") if "location_bin" in cols else 0)
+        part_col = st.selectbox("DB: part_number", cols, index=cols.index("part_number") if "part_number" in cols else 0)
+        qty_col = st.selectbox("DB: quantity_on_hand", cols, index=cols.index("quantity_on_hand") if "quantity_on_hand" in cols else 0)
+        bin_col = st.selectbox("DB: location_bin", cols, index=cols.index("location_bin") if "location_bin" in cols else 0)
 
         if st.button("🚀 START STREAMED IMPORT"):
             try:
                 conn = get_conn()
                 cur = conn.cursor()
                 
-                # We still truncate for a clean slate, but the UPSERT handles any duplicates within the file itself
-                st.warning("Wiping existing inventory...")
+                st.warning("Wiping existing inventory for clean master list...")
                 cur.execute("TRUNCATE TABLE inventory;")
                 conn.commit()
 
@@ -57,7 +54,6 @@ if operation == "Upload Inventory":
                 for i, chunk in enumerate(reader):
                     data_to_insert = chunk[[part_col, qty_col, bin_col]].values.tolist()
                     
-                    # THE FIX: ON CONFLICT DO UPDATE
                     execute_values(cur, """
                         INSERT INTO inventory (part_number, quantity_on_hand, location_bin) 
                         VALUES %s
@@ -79,11 +75,11 @@ if operation == "Upload Inventory":
             except Exception as e:
                 st.error(f"Stream Failure: {e}")
 
-# ---------- OPERATION 2: UPLOAD ACTIVITY LOG ----------
+# ---------- OPERATION 2: UPLOAD ACTIVITY LOG (SALES & RECEIVING) ----------
 
 elif operation == "Upload Activity Log":
     st.header("🕵️ Upload Daily Activity Log")
-    st.info("Use this for daily DMS exports or the forensic demo CSV. This ADDS to the log.")
+    st.info("Upload the daily CSV from the DMS. This handles SALES, RECEIVING, and ADJUSTMENTS.")
 
     uploaded_file = st.file_uploader("Choose Activity Log CSV", type="csv")
 
@@ -142,19 +138,26 @@ elif operation == "View Inventory":
     except Exception as e:
         st.error(f"Error loading stats: {e}")
 
-# ---------- OPERATION 4: NUKE ----------
+# ---------- OPERATION 4: NUKE (WITH SAFETY LOCK) ----------
 
 elif operation == "NUKE":
-    st.header("☢️ NUKE TABLES")
+    st.header("☢️ Danger Zone: Wipe Database")
+    st.warning("This action is permanent. A password is required to proceed.")
+    
     target = st.selectbox("Select table to wipe:", ["inventory", "receiving_log"])
+    password_input = st.text_input("Enter Admin Password to Unlock:", type="password")
+    
     if st.button(f"CONFIRM WIPE {target.upper()}"):
-        try:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute(f"TRUNCATE TABLE {target};")
-            conn.commit()
-            st.success(f"{target} has been cleared.")
-            cur.close()
-            conn.close()
-        except Exception as e:
-            st.error(f"Nuke Failed: {e}")
+        if password_input == "RIDE1-ADMIN":
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(f"TRUNCATE TABLE {target};")
+                conn.commit()
+                st.success(f"SUCCESS: {target} has been cleared.")
+                cur.close()
+                conn.close()
+            except Exception as e:
+                st.error(f"Nuke Failed: {e}")
+        else:
+            st.error("❌ INVALID PASSWORD. Access Denied.")
