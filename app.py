@@ -56,23 +56,18 @@ def map_columns(df, target_cols):
     }
     
     rename_map = {}
+    used_targets = set()
     for orig in list(df.columns):
         norm = normalize_col(orig)
         for target, syns in synonyms.items():
-            # If the normalized CSV header matches a synonym or the target name
             if norm in [normalize_col(s) for s in syns] + [target]:
-                # Only map if the target column actually exists in the DB table
-                if target in target_cols:
+                if target in target_cols and target not in used_targets:
                     rename_map[orig] = target
+                    used_targets.add(target)
                 break
     
-    # Rename the columns we found
     df = df.rename(columns=rename_map)
-    
-    # Drop duplicate columns, keep first occurrence
     df = df.loc[:, ~df.columns.duplicated()]
-    
-    # Keep ONLY the columns that now match the DB target_cols
     valid_cols = [c for c in df.columns if c in target_cols]
     return df[valid_cols]
 
@@ -148,52 +143,61 @@ elif page == "Leak Detector":
         except:
             st.write("Archive unavailable.")
 
-elif page == "Daily DMS Sync":
-    st.title("🔄 Daily DMS Sync & Forensic Audit")
-    f = st.file_uploader("Upload Daily Log CSV", type="csv")
-    if f and st.button("🔍 RUN FORENSIC AUDIT"):
-        try:
-            df = pd.read_csv(io.StringIO(f.getvalue().decode('utf-8')), dtype=str)
-            with engine.connect() as conn:
-                res = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='receiving_log'"))
-                recv_cols = [r[0] for r in res.fetchall()]
-            df_mapped = map_columns(df, recv_cols)
-            df_mapped.to_sql('receiving_log', engine, if_exists='append', index=False)
-            st.success(f"Audit Complete: {len(df_mapped)} rows synced.")
-        except Exception as e:
-            st.error(f"Upload Error: {e}")
-
-elif page == "Initial Inventory Upload":
-    st.title("📦 Industrial Inventory Uploader")
-    st.info("This will wipe the current inventory and replace it with the new file.")
-    f = st.file_uploader("Upload Master Inventory CSV", type="csv")
+elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
+    st.title(f"📥 {page}")
+    target_table = 'inventory' if page == "Initial Inventory Upload" else 'receiving_log'
     
-    if f and st.button("🚀 START IMPORT"):
-        try:
-            # 1. Get the actual DB columns for the inventory table
-            with engine.connect() as conn:
-                res = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='inventory'"))
-                inv_cols = [r[0] for r in res.fetchall()]
+    f = st.file_uploader(f"Upload {target_table.replace('_',' ').title()} CSV", type="csv")
+    
+    if f:
+        df_raw = pd.read_csv(io.StringIO(f.getvalue().decode('utf-8')), dtype=str)
+        st.write("### 🛠 Step 1: Map your Columns")
+        st.info("We've tried to match them automatically. Please confirm below.")
+        
+        # Get DB Columns
+        with engine.connect() as conn:
+            res = conn.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name='{target_table}'"))
+            db_cols = [r[0] for r in res.fetchall() if r[0] not in ['id', 'resolved_at', 'resolution_status', 'resolution_note']]
+
+        # Mapping UI
+        mapping = {}
+        csv_cols = ["-- Skip --"] + list(df_raw.columns)
+        
+        cols = st.columns(len(db_cols) // 2 + 1)
+        for i, db_c in enumerate(db_cols):
+            # Try to find a smart default
+            default_idx = 0
+            norm_db = normalize_col(db_c)
+            for j, csv_c in enumerate(csv_cols):
+                if normalize_col(csv_c) == norm_db or any(s in normalize_col(csv_c) for s in [norm_db, 'part', 'qty', 'price']):
+                    default_idx = j
+                    break
             
-            # 2. Load the CSV
-            df = pd.read_csv(io.StringIO(f.getvalue().decode('utf-8')), dtype=str)
-            
-            # 3. Map the columns (e.g. 'Part Number' -> 'part_number')
-            df_mapped = map_columns(df, inv_cols)
-            
-            if df_mapped.empty:
-                st.error("Could not find any matching columns (Part Number, Qty, etc.) in your file.")
-            else:
-                # 4. Wipe and Upload
-                with engine.begin() as conn:
-                    conn.execute(text("TRUNCATE TABLE inventory"))
+            with cols[i % (len(db_cols) // 2 + 1)]:
+                mapping[db_c] = st.selectbox(f"Database: {db_c}", csv_cols, index=default_idx)
+
+        if st.button("🚀 START IMPORT", use_container_width=True):
+            try:
+                # Create the mapped dataframe
+                final_mapping = {v: k for k, v in mapping.items() if v != "-- Skip --"}
                 
-                # Upload in chunks for speed/stability
-                df_mapped.to_sql('inventory', engine, if_exists='append', index=False, chunksize=10000)
-                st.success(f"Success! {len(df_mapped):,} items imported.")
+                # Check for duplicates in mapping
+                if len(set(final_mapping.keys())) != len(final_mapping.keys()):
+                    st.error("Error: You mapped the same CSV column to multiple database fields.")
+                    st.stop()
+
+                df_final = df_raw[list(final_mapping.keys())].rename(columns=final_mapping)
+                
+                with engine.begin() as conn:
+                    if page == "Initial Inventory Upload":
+                        conn.execute(text("TRUNCATE TABLE inventory"))
+                    
+                    df_final.to_sql(target_table, engine, if_exists='append', index=False, chunksize=10000)
+                
+                st.success(f"Success! {len(df_final):,} rows imported into {target_table}.")
                 st.balloons()
-        except Exception as e:
-            st.error(f"Import Error: {e}")
+            except Exception as e:
+                st.error(f"Import Error: {e}")
 
 elif page == "⚠️ NUKE":
     st.title("☢️ NUCLEAR RESET")
