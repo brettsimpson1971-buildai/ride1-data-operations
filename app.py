@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
-import io, re, os, json
+import io, re
 
 # ---------- CONFIG ----------
-st.set_page_config(page_title='Ride 1 Command Center', layout='wide')
+st.set_page_config(page_title="Ride 1 Command Center", layout="wide")
 engine = create_engine("postgresql://ride1admin@127.0.0.1:5432/ride1", pool_pre_ping=True)
 
 # ---------- DATABASE MIGRATION (EXPAND DB) ----------
@@ -110,7 +110,7 @@ if page == "Command Center":
 
 elif page == "Inventory Upload":
     st.title("📥 Master Inventory Upload")
-    uploaded = st.file_uploader("Upload Shawn's CSV (Ride1_Combined_Sync.csv)", type="csv")
+    uploaded = st.file_uploader("Upload Shawn's CSV", type="csv")
     
     if uploaded:
         df_raw = pd.read_csv(io.StringIO(uploaded.getvalue().decode('utf-8')), dtype=str)
