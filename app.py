@@ -41,6 +41,7 @@ def normalize_col(col):
 def map_columns(df, target_cols):
     """
     Maps messy CSV headers to clean Database columns using synonyms.
+    Drops duplicate columns after renaming to avoid conflicts.
     """
     synonyms = {
         'part_number': ['part', 'part_no', 'part#', 'sku', 'item', 'item_number', 'partnum', 'part_number'],
@@ -68,7 +69,10 @@ def map_columns(df, target_cols):
     # Rename the columns we found
     df = df.rename(columns=rename_map)
     
-    # CRITICAL: Keep ONLY the columns that now match the DB target_cols
+    # Drop duplicate columns, keep first occurrence
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    # Keep ONLY the columns that now match the DB target_cols
     valid_cols = [c for c in df.columns if c in target_cols]
     return df[valid_cols]
 
