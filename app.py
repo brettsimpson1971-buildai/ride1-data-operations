@@ -3,18 +3,12 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 import io, re, os, json
 
-# ---------- CONFIG ----------
 st.set_page_config(page_title='Ride 1 Command Center', layout='wide', initial_sidebar_state='expanded')
 engine = create_engine("postgresql://ride1admin@127.0.0.1:5432/ride1", pool_pre_ping=True)
 
-# Persistent mapping filename (single-file in working dir)
 MAPPINGS_FILE = "column_mappings.json"
-
-# Global preference: if True prefer columns containing 'after'/'adj' variants for quantity
 PREFER_QTY_AFTER = True
-# ----------------------------
 
-# ---------- LOGIN ----------
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
@@ -36,9 +30,7 @@ def login_screen():
 if not st.session_state["authenticated"]:
     login_screen()
     st.stop()
-# -------------------------
 
-# ---------- UTILITIES ----------
 def normalize_col(col):
     s = str(col).strip().lower()
     s = re.sub(r'[#@\\\/&]', '_', s)
@@ -65,38 +57,23 @@ def save_mappings(mappings):
         return False
 
 def choose_preferred(csv_cols, db_col):
-    """
-    Choose preferred csv column among csv_cols for db_col using heuristics and global preferences.
-    """
     norm_db = normalize_col(db_col)
-    # direct normalized match first
     for c in csv_cols:
         if normalize_col(c) == norm_db:
             return c
-
-    # Quantity preference when configured
     if PREFER_QTY_AFTER and 'quantity' in norm_db:
-        # prefer 'after', 'adj', 'adjust', 'after_adj', 'qty_after'
         for c in csv_cols:
             nc = normalize_col(c)
             if any(k in nc for k in ['after', 'adj', 'adjust', 'qty_after', 'after_adj', 'final']):
                 return c
-
-    # general preference keywords
     prefs = ['after', 'adj', 'adjust', 'final', 'qty_after', 'after_adj', 'count']
     for p in prefs:
         for c in csv_cols:
             if p in normalize_col(c):
                 return c
-
-    # fallback to first
     return csv_cols[0]
 
 def automatic_mapping_suggestions(csv_cols, db_cols):
-    """
-    Provide a best-effort mapping db_col -> csv_col using synonyms and heuristics.
-    Returns dict db_col -> csv_col_or_skip
-    """
     synonyms = {
         'part_number': ['part', 'part_no', 'part#', 'sku', 'item', 'item_number', 'partnum', 'part_number'],
         'location_bin': ['bin', 'bin_number', 'bin#', 'bin_no', 'location', 'loc'],
@@ -111,15 +88,12 @@ def automatic_mapping_suggestions(csv_cols, db_cols):
     csv_normal_map = {normalize_col(c): c for c in csv_cols}
     suggestion = {}
     used_csv = set()
-
     for db in db_cols:
         dbn = normalize_col(db)
-        # exact normalized match
         if dbn in csv_normal_map:
             suggestion[db] = csv_normal_map[dbn]
             used_csv.add(suggestion[db])
             continue
-        # synonyms
         picked = None
         syns = synonyms.get(db, []) + [db]
         for s in syns:
@@ -130,7 +104,6 @@ def automatic_mapping_suggestions(csv_cols, db_cols):
                     break
             if picked:
                 break
-        # heuristic: part/qty/price grouping
         if not picked:
             for nc, orig in csv_normal_map.items():
                 if dbn in ['part_number','part'] and any(k in nc for k in ['part','sku','item']):
@@ -145,9 +118,24 @@ def automatic_mapping_suggestions(csv_cols, db_cols):
         else:
             suggestion[db] = "-- Skip --"
     return suggestion
-# -------------------------------
 
-# ---------- SIDEBAR ----------
+def make_columns_unique(cols):
+    seen = {}
+    result = []
+    for c in cols:
+        if c not in seen:
+            seen[c] = 0
+            result.append(c)
+        else:
+            seen[c] += 1
+            new_c = f"{c}_{seen[c]}"
+            while new_c in seen:
+                seen[c] += 1
+                new_c = f"{c}_{seen[c]}"
+            seen[new_c] = 0
+            result.append(new_c)
+    return result
+
 with st.sidebar:
     st.image("https://assets.zyrosite.com/46uOcFMIrXbOQmGo/logo.png-354IavGq7CUmvHlz.png", width=200)
     st.write("👤 User: **ride1**")
@@ -156,9 +144,7 @@ with st.sidebar:
         st.rerun()
     st.divider()
     page = st.radio("Navigation", ["Command Center", "Leak Detector", "Initial Inventory Upload", "Daily DMS Sync", "⚠️ NUKE"])
-# -------------------------
 
-# ---------- PAGES ----------
 if page == "Command Center":
     st.title("🚨 RIDE 1 | FORENSIC COMMAND CENTER")
     try:
@@ -215,18 +201,15 @@ elif page == "Leak Detector":
         except Exception:
             st.write("Archive unavailable.")
 
-# Upload/mapping page for both inventory & receiving_log
 elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
     st.title(f"📥 {page}")
     target_table = 'inventory' if page == "Initial Inventory Upload" else 'receiving_log'
     uploaded = st.file_uploader(f"Upload {target_table.replace('_',' ').title()} CSV", type="csv")
 
-    # Load persisted mappings
     mappings = load_mappings()
 
     if uploaded:
         try:
-            # Read CSV (string dtype to preserve everything)
             df_raw = pd.read_csv(io.StringIO(uploaded.getvalue().decode('utf-8')), dtype=str)
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
@@ -235,34 +218,26 @@ elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
         st.write("### 🛠 Step 1: Map your Columns")
         st.info("Confirm or change mappings. You can save mappings for this filename to reuse later.")
 
-        # DB columns (exclude internal cols)
         with engine.connect() as conn:
             res = conn.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name='{target_table}'"))
             db_cols = [r[0] for r in res.fetchall() if r[0] not in ['id', 'resolved_at', 'resolution_status', 'resolution_note']]
 
         csv_cols = ["-- Skip --"] + list(df_raw.columns)
 
-        # Try to get saved mapping by filename base
         file_key = os.path.splitext(uploaded.name)[0]
         saved_map = mappings.get(file_key, {})
 
-        # If no saved mapping, generate automatic suggestions
-        suggestions = {}
         if saved_map:
-            # saved_map is expected db_col -> csv_col
             suggestions = saved_map
             st.info(f"Loaded saved mapping for filename: {uploaded.name}")
         else:
-            # generate best-effort suggestions
             suggestions = automatic_mapping_suggestions(list(df_raw.columns), db_cols)
 
-        # Build UI mapping controls (db_col -> selected csv)
         mapping = {}
         group_count = max(1, (len(db_cols) // 2) + 1)
         cols = st.columns(group_count)
         for i, db_c in enumerate(db_cols):
             default_value = suggestions.get(db_c, "-- Skip --")
-            # If default_value is not present in csv_cols, fallback to "-- Skip --"
             if default_value not in csv_cols:
                 default_index = 0
             else:
@@ -270,30 +245,23 @@ elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
             with cols[i % group_count]:
                 mapping[db_c] = st.selectbox(f"DB: {db_c}", csv_cols, index=default_index, key=f"map_{db_c}")
 
-        # Option: save current UI mapping as default for this filename before import
         col1, col2 = st.columns([1,1])
         with col1:
             if st.button("Save mapping for this filename"):
-                # Build db->csv map from current UI and save
                 to_save = {db: sel for db, sel in mapping.items() if sel != "-- Skip --"}
                 mappings[file_key] = to_save
                 if save_mappings(mappings):
                     st.success(f"Mapping saved for filename key: {file_key}")
                 else:
                     st.error("Failed to save mapping.")
-
         with col2:
             if st.checkbox("Always prefer 'Qty After' style columns for quantity", value=PREFER_QTY_AFTER):
-                # Note: toggling here only affects session; to make permanent change edit PREFER_QTY_AFTER in file
                 st.info("Preference applied for this upload (session only).")
 
-        # Import action
         if st.button("🚀 START IMPORT", use_container_width=True):
             try:
-                # Build final_mapping: csv_col -> db_col
                 final_mapping = {v: k for k, v in mapping.items() if v != "-- Skip --"}
 
-                # Detect cases where there are multiple CSV columns mapping to same DB column
                 db_to_csv = {}
                 for csv_col, db_col in final_mapping.items():
                     db_to_csv.setdefault(db_col, []).append(csv_col)
@@ -310,46 +278,37 @@ elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
                         for db_col, srcs in dupes.items():
                             preferred = choose_preferred(srcs, db_col)
                             resolved_db_to_csv[db_col] = preferred
-                        # keep other (non-duplicated) mappings too
                         for db_col, srcs in db_to_csv.items():
                             if db_col not in resolved_db_to_csv:
                                 resolved_db_to_csv[db_col] = srcs[0]
-                        # rebuild final_mapping csv->db
                         final_mapping = {csv: db for db, csv in resolved_db_to_csv.items()}
                         st.success("Auto-resolve applied.")
                     else:
                         st.stop()
 
-                # After resolution, build DataFrame and rename
                 csv_keys = list(final_mapping.keys())
                 if not csv_keys:
                     st.error("No CSV columns selected for import. Please map at least one column.")
                     st.stop()
 
-                # Build df_final using only chosen CSV columns (preserve column order)
                 df_final = df_raw[csv_keys].rename(columns=final_mapping)
 
-                # DEBUG: show columns BEFORE duplicate drop
-                st.write("Columns to be uploaded (before duplicate drop):", list(df_final.columns))
+                st.write("Columns to be uploaded (before making unique):", list(df_final.columns))
 
-                # If duplicate column names present in df_final, drop duplicate names (keep first)
-                if df_final.columns.duplicated().any():
-                    dup_names = list(df_final.columns[df_final.columns.duplicated()].unique())
-                    st.warning(f"Duplicate column names detected in final DataFrame: {dup_names}. Dropping duplicates (keeping first occurrence).")
-                    df_final = df_final.loc[:, ~df_final.columns.duplicated()]
+                # Make columns unique by appending suffixes to duplicates
+                unique_cols = make_columns_unique(df_final.columns)
+                if list(df_final.columns) != unique_cols:
+                    st.warning("Duplicate column names detected. Renaming duplicates to unique names.")
+                    df_final.columns = unique_cols
 
-                # DEBUG: show columns AFTER duplicate drop
-                st.write("Columns to be uploaded (after duplicate drop):", list(df_final.columns))
+                st.write("Columns to be uploaded (after making unique):", list(df_final.columns))
 
-                # Sanity checks
                 if target_table == 'inventory' and 'part_number' not in df_final.columns:
                     st.error("Inventory import requires a 'part_number' mapping. Please map the Part Number column.")
                     st.stop()
 
-                # Persist mapping automatically on success (db_col -> csv_col)
                 persist_map = {v: k for k, v in final_mapping.items()}
 
-                # Write to DB
                 with engine.begin() as conn:
                     if page == "Initial Inventory Upload":
                         conn.execute(text("TRUNCATE TABLE inventory"))
@@ -358,7 +317,6 @@ elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
                 st.success(f"Success! {len(df_final):,} rows imported into {target_table}.")
                 st.balloons()
 
-                # Save mapping for this filename (persist)
                 mappings[file_key] = persist_map
                 save_mappings(mappings)
 
@@ -373,4 +331,3 @@ elif page == "⚠️ NUKE":
             conn.execute(text("TRUNCATE TABLE inventory"))
             conn.execute(text("TRUNCATE TABLE receiving_log"))
         st.success("System Wiped.")
-# -------------------------
