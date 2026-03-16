@@ -38,10 +38,27 @@ def normalize_col(col):
     s = re.sub(r'[^a-z0-9_]', '', s)
     return s.strip('_')
 
+# small heuristic to pick preferred CSV column among duplicates for a given DB target
+def choose_preferred(csv_cols, db_col):
+    # prefer columns containing 'after', 'adj', 'adjust', or exact db_col match
+    prefs = ['after', 'adj', 'adjust', 'final', 'qty_after', 'after_adj']
+    norm_db = normalize_col(db_col)
+    # exact normalized match
+    for c in csv_cols:
+        if normalize_col(c) == norm_db:
+            return c
+    # prefer ones containing preference keywords
+    for p in prefs:
+        for c in csv_cols:
+            if p in normalize_col(c):
+                return c
+    # fallback to first
+    return csv_cols[0]
+
 def map_columns(df, target_cols):
     """
-    Maps messy CSV headers to clean Database columns using synonyms.
-    Drops duplicate columns after renaming to avoid conflicts.
+    Old-style automatic mapping fallback (keeps first mapping for each target).
+    This is still used if user chooses not to use the mapping UI.
     """
     synonyms = {
         'part_number': ['part', 'part_no', 'part#', 'sku', 'item', 'item_number', 'partnum', 'part_number'],
@@ -143,6 +160,7 @@ elif page == "Leak Detector":
         except:
             st.write("Archive unavailable.")
 
+# Combined, robust mapping/upload page for both Inventory and Receiving Log
 elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
     st.title(f"📥 {page}")
     target_table = 'inventory' if page == "Initial Inventory Upload" else 'receiving_log'
@@ -150,52 +168,116 @@ elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
     f = st.file_uploader(f"Upload {target_table.replace('_',' ').title()} CSV", type="csv")
     
     if f:
-        df_raw = pd.read_csv(io.StringIO(f.getvalue().decode('utf-8')), dtype=str)
+        try:
+            df_raw = pd.read_csv(io.StringIO(f.getvalue().decode('utf-8')), dtype=str)
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+            st.stop()
+
         st.write("### 🛠 Step 1: Map your Columns")
-        st.info("We've tried to match them automatically. Please confirm below.")
-        
-        # Get DB Columns
+        st.info("We've pre-selected smart matches. Confirm or change them. Avoid mapping multiple DB fields to the same CSV column.")
+
+        # Get DB Columns (exclude some internal/reserved columns)
         with engine.connect() as conn:
             res = conn.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name='{target_table}'"))
             db_cols = [r[0] for r in res.fetchall() if r[0] not in ['id', 'resolved_at', 'resolution_status', 'resolution_note']]
 
-        # Mapping UI
+        # Mapping UI: present DB columns with selectbox of CSV columns (or -- Skip --)
         mapping = {}
         csv_cols = ["-- Skip --"] + list(df_raw.columns)
-        
-        cols = st.columns(len(db_cols) // 2 + 1)
+
+        # layout columns (2 per column group)
+        group_count = max(1, (len(db_cols) // 2) + 1)
+        cols = st.columns(group_count)
         for i, db_c in enumerate(db_cols):
-            # Try to find a smart default
+            # Try to determine a smart default index
             default_idx = 0
             norm_db = normalize_col(db_c)
             for j, csv_c in enumerate(csv_cols):
-                if normalize_col(csv_c) == norm_db or any(s in normalize_col(csv_c) for s in [norm_db, 'part', 'qty', 'price']):
+                if csv_c == "-- Skip --":
+                    continue
+                if normalize_col(csv_c) == norm_db:
                     default_idx = j
                     break
-            
-            with cols[i % (len(db_cols) // 2 + 1)]:
-                mapping[db_c] = st.selectbox(f"Database: {db_c}", csv_cols, index=default_idx)
+                # heuristics: part, qty, price
+                if any(k in normalize_col(csv_c) for k in ['part', 'qty', 'price']) and any(k in norm_db for k in ['part', 'qty', 'price']):
+                    default_idx = j
+                    break
 
+            with cols[i % group_count]:
+                mapping[db_c] = st.selectbox(f"DB: {db_c}", csv_cols, index=default_idx, key=f"map_{db_c}")
+
+        # Action: start import (with duplicate detection & auto-resolve)
         if st.button("🚀 START IMPORT", use_container_width=True):
             try:
-                # Create the mapped dataframe
+                # mapping: db_col -> selected csv col (or "-- Skip --")
+                # Build final_mapping: csv_col -> db_col for non-skip selections
                 final_mapping = {v: k for k, v in mapping.items() if v != "-- Skip --"}
-                
-                # Check for duplicates in mapping
-                if len(set(final_mapping.keys())) != len(final_mapping.keys()):
-                    st.error("Error: You mapped the same CSV column to multiple database fields.")
+
+                # Detect duplicates where multiple CSV columns map to same DB column.
+                # Actually 'final_mapping' keys are CSV names and values are DB names; we need db->list(csv)
+                duplicates = {}
+                for csv_col, db_col in final_mapping.items():
+                    duplicates.setdefault(db_col, []).append(csv_col)
+                dupes = {db: srcs for db, srcs in duplicates.items() if len(srcs) > 1}
+
+                if dupes:
+                    # Show clear message listing conflicts
+                    err_lines = []
+                    for db_col, srcs in dupes.items():
+                        err_lines.append(f"{db_col}: {', '.join(srcs)}")
+                    st.error("Mapping error — multiple CSV columns mapped to the same DB field:")
+                    for line in err_lines:
+                        st.write(f"- {line}")
+                    st.info("Option A: Fix the mapping above (select a single CSV column per DB field).")
+                    st.info("Option B: Auto-resolve duplicates (keep preferred column per DB field).")
+
+                    if st.button("Auto-resolve duplicates (preferred heuristics)"):
+                        # Resolve for each duplicated db_col, choose a preferred csv column
+                        resolved_db_to_csv = {}
+                        for db_col, srcs in duplicates.items():
+                            preferred = choose_preferred(srcs, db_col)
+                            resolved_db_to_csv[db_col] = preferred
+                        # For non-duplicated mappings, copy as-is
+                        for db_col, srcs in duplicates.items():
+                            pass
+                        for csv_col, db_col in final_mapping.items():
+                            if db_col not in resolved_db_to_csv:
+                                resolved_db_to_csv[db_col] = csv_col
+                        # Build final_mapping csv->db from resolved_db_to_csv
+                        final_mapping = {csv: db for db, csv in resolved_db_to_csv.items()}
+
+                    else:
+                        st.stop()
+
+                # After resolution, final_mapping keys = CSV columns, values = DB columns
+                csv_keys = list(final_mapping.keys())
+                if not csv_keys:
+                    st.error("No CSV columns selected for import. Please map at least one column.")
                     st.stop()
 
-                df_final = df_raw[list(final_mapping.keys())].rename(columns=final_mapping)
-                
+                # Build DataFrame and rename columns to DB names
+                df_final = df_raw[csv_keys].rename(columns=final_mapping)
+
+                # Safety: ensure unique column names in df_final
+                if df_final.columns.duplicated().any():
+                    st.error("Internal error: duplicate column names still present after mapping. Please re-check the mapping.")
+                    st.stop()
+
+                # Optionally: quick sanity checks (e.g., ensure part_number exists for inventory)
+                if target_table == 'inventory' and 'part_number' not in df_final.columns:
+                    st.error("Inventory import requires a 'part_number' mapping. Please map the Part Number column.")
+                    st.stop()
+
+                # Write to DB
                 with engine.begin() as conn:
                     if page == "Initial Inventory Upload":
                         conn.execute(text("TRUNCATE TABLE inventory"))
-                    
                     df_final.to_sql(target_table, engine, if_exists='append', index=False, chunksize=10000)
-                
+
                 st.success(f"Success! {len(df_final):,} rows imported into {target_table}.")
                 st.balloons()
+
             except Exception as e:
                 st.error(f"Import Error: {e}")
 
