@@ -1,12 +1,20 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
-import io, re
+import io, re, os, json
 
+# ---------- CONFIG ----------
 st.set_page_config(page_title='Ride 1 Command Center', layout='wide', initial_sidebar_state='expanded')
 engine = create_engine("postgresql://ride1admin@127.0.0.1:5432/ride1", pool_pre_ping=True)
 
-# 1. LOGIN SYSTEM
+# Persistent mapping filename (single-file in working dir)
+MAPPINGS_FILE = "column_mappings.json"
+
+# Global preference: if True prefer columns containing 'after'/'adj' variants for quantity
+PREFER_QTY_AFTER = True
+# ----------------------------
+
+# ---------- LOGIN ----------
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
@@ -28,8 +36,9 @@ def login_screen():
 if not st.session_state["authenticated"]:
     login_screen()
     st.stop()
+# -------------------------
 
-# 2. HELPERS
+# ---------- UTILITIES ----------
 def normalize_col(col):
     s = str(col).strip().lower()
     s = re.sub(r'[#@\\\/&]', '_', s)
@@ -37,46 +46,108 @@ def normalize_col(col):
     s = re.sub(r'[^a-z0-9_]', '', s)
     return s.strip('_')
 
+def load_mappings():
+    if os.path.exists(MAPPINGS_FILE):
+        try:
+            with open(MAPPINGS_FILE, 'r') as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+    return {}
+
+def save_mappings(mappings):
+    try:
+        with open(MAPPINGS_FILE, 'w') as fh:
+            json.dump(mappings, fh, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Failed to save mappings: {e}")
+        return False
+
 def choose_preferred(csv_cols, db_col):
-    prefs = ['after', 'adj', 'adjust', 'final', 'qty_after', 'after_adj']
+    """
+    Choose preferred csv column among csv_cols for db_col using heuristics and global preferences.
+    """
     norm_db = normalize_col(db_col)
+    # direct normalized match first
     for c in csv_cols:
         if normalize_col(c) == norm_db:
             return c
+
+    # Quantity preference when configured
+    if PREFER_QTY_AFTER and 'quantity' in norm_db:
+        # prefer 'after', 'adj', 'adjust', 'after_adj', 'qty_after'
+        for c in csv_cols:
+            nc = normalize_col(c)
+            if any(k in nc for k in ['after', 'adj', 'adjust', 'qty_after', 'after_adj', 'final']):
+                return c
+
+    # general preference keywords
+    prefs = ['after', 'adj', 'adjust', 'final', 'qty_after', 'after_adj', 'count']
     for p in prefs:
         for c in csv_cols:
             if p in normalize_col(c):
                 return c
+
+    # fallback to first
     return csv_cols[0]
 
-def map_columns(df, target_cols):
+def automatic_mapping_suggestions(csv_cols, db_cols):
+    """
+    Provide a best-effort mapping db_col -> csv_col using synonyms and heuristics.
+    Returns dict db_col -> csv_col_or_skip
+    """
     synonyms = {
         'part_number': ['part', 'part_no', 'part#', 'sku', 'item', 'item_number', 'partnum', 'part_number'],
         'location_bin': ['bin', 'bin_number', 'bin#', 'bin_no', 'location', 'loc'],
-        'quantity': ['qty', 'quantity_on_hand', 'on_hand', 'count', 'units', 'quantity', 'qty_after_adj'],
+        'quantity': ['qty', 'quantity_on_hand', 'on_hand', 'count', 'units', 'quantity', 'qty_after_adj', 'qty_after', 'qtyafter'],
         'employee_id': ['emp', 'emp_id', 'user', 'employee', 'staff', 'tech'],
         'variance_amount': ['variance', 'diff', 'shrink', 'loss'],
         'severity_level': ['severity', 'status', 'priority'],
         'description': ['description', 'desc', 'notes'],
         'timestamp': ['timestamp', 'time', 'date', 'datetime'],
-        'price': ['price', 'msrp', 'unit_price', 'cost_plus']
+        'price': ['price', 'msrp', 'unit_price', 'cost_plus', 'cost']
     }
-    rename_map = {}
-    used_targets = set()
-    for orig in list(df.columns):
-        norm = normalize_col(orig)
-        for target, syns in synonyms.items():
-            if norm in [normalize_col(s) for s in syns] + [target]:
-                if target in target_cols and target not in used_targets:
-                    rename_map[orig] = target
-                    used_targets.add(target)
-                break
-    df = df.rename(columns=rename_map)
-    df = df.loc[:, ~df.columns.duplicated()]
-    valid_cols = [c for c in df.columns if c in target_cols]
-    return df[valid_cols]
+    csv_normal_map = {normalize_col(c): c for c in csv_cols}
+    suggestion = {}
+    used_csv = set()
 
-# 3. SIDEBAR
+    for db in db_cols:
+        dbn = normalize_col(db)
+        # exact normalized match
+        if dbn in csv_normal_map:
+            suggestion[db] = csv_normal_map[dbn]
+            used_csv.add(suggestion[db])
+            continue
+        # synonyms
+        picked = None
+        syns = synonyms.get(db, []) + [db]
+        for s in syns:
+            ns = normalize_col(s)
+            for nc, orig in csv_normal_map.items():
+                if ns == nc and orig not in used_csv:
+                    picked = orig
+                    break
+            if picked:
+                break
+        # heuristic: part/qty/price grouping
+        if not picked:
+            for nc, orig in csv_normal_map.items():
+                if dbn in ['part_number','part'] and any(k in nc for k in ['part','sku','item']):
+                    picked = orig; break
+                if dbn in ['quantity','qty','count'] and any(k in nc for k in ['qty','quantity','count']):
+                    picked = orig; break
+                if dbn in ['price','cost'] and any(k in nc for k in ['price','cost','msrp']):
+                    picked = orig; break
+        if picked and picked not in used_csv:
+            suggestion[db] = picked
+            used_csv.add(picked)
+        else:
+            suggestion[db] = "-- Skip --"
+    return suggestion
+# -------------------------------
+
+# ---------- SIDEBAR ----------
 with st.sidebar:
     st.image("https://assets.zyrosite.com/46uOcFMIrXbOQmGo/logo.png-354IavGq7CUmvHlz.png", width=200)
     st.write("👤 User: **ride1**")
@@ -85,8 +156,9 @@ with st.sidebar:
         st.rerun()
     st.divider()
     page = st.radio("Navigation", ["Command Center", "Leak Detector", "Initial Inventory Upload", "Daily DMS Sync", "⚠️ NUKE"])
+# -------------------------
 
-# 4. PAGES
+# ---------- PAGES ----------
 if page == "Command Center":
     st.title("🚨 RIDE 1 | FORENSIC COMMAND CENTER")
     try:
@@ -105,7 +177,7 @@ if page == "Command Center":
         st.subheader("System Health")
         st.success("A.I. Forensic Engine: ACTIVE")
         st.success("Database Connection: STABLE")
-    except:
+    except Exception:
         st.info("Database initializing...")
 
 elif page == "Leak Detector":
@@ -140,88 +212,156 @@ elif page == "Leak Detector":
                 st.write("No resolved cases yet.")
             else:
                 st.dataframe(archive[['timestamp', 'part_number', 'employee_id', 'variance_amount', 'resolution_note', 'resolved_at']], use_container_width=True)
-        except:
+        except Exception:
             st.write("Archive unavailable.")
 
+# Upload/mapping page for both inventory & receiving_log
 elif page in ["Initial Inventory Upload", "Daily DMS Sync"]:
     st.title(f"📥 {page}")
     target_table = 'inventory' if page == "Initial Inventory Upload" else 'receiving_log'
-    f = st.file_uploader(f"Upload {target_table.replace('_',' ').title()} CSV", type="csv")
-    if f:
+    uploaded = st.file_uploader(f"Upload {target_table.replace('_',' ').title()} CSV", type="csv")
+
+    # Load persisted mappings
+    mappings = load_mappings()
+
+    if uploaded:
         try:
-            df_raw = pd.read_csv(io.StringIO(f.getvalue().decode('utf-8')), dtype=str)
+            # Read CSV (string dtype to preserve everything)
+            df_raw = pd.read_csv(io.StringIO(uploaded.getvalue().decode('utf-8')), dtype=str)
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
             st.stop()
+
         st.write("### 🛠 Step 1: Map your Columns")
-        st.info("We've pre-selected smart matches. Confirm or change them. Avoid mapping multiple DB fields to the same CSV column.")
+        st.info("Confirm or change mappings. You can save mappings for this filename to reuse later.")
+
+        # DB columns (exclude internal cols)
         with engine.connect() as conn:
             res = conn.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name='{target_table}'"))
             db_cols = [r[0] for r in res.fetchall() if r[0] not in ['id', 'resolved_at', 'resolution_status', 'resolution_note']]
-        mapping = {}
+
         csv_cols = ["-- Skip --"] + list(df_raw.columns)
+
+        # Try to get saved mapping by filename base
+        file_key = os.path.splitext(uploaded.name)[0]
+        saved_map = mappings.get(file_key, {})
+
+        # If no saved mapping, generate automatic suggestions
+        suggestions = {}
+        if saved_map:
+            # saved_map is expected db_col -> csv_col
+            suggestions = saved_map
+            st.info(f"Loaded saved mapping for filename: {uploaded.name}")
+        else:
+            # generate best-effort suggestions
+            suggestions = automatic_mapping_suggestions(list(df_raw.columns), db_cols)
+
+        # Build UI mapping controls (db_col -> selected csv)
+        mapping = {}
         group_count = max(1, (len(db_cols) // 2) + 1)
         cols = st.columns(group_count)
         for i, db_c in enumerate(db_cols):
-            default_idx = 0
-            norm_db = normalize_col(db_c)
-            for j, csv_c in enumerate(csv_cols):
-                if csv_c == "-- Skip --":
-                    continue
-                if normalize_col(csv_c) == norm_db:
-                    default_idx = j
-                    break
-                if any(k in normalize_col(csv_c) for k in ['part', 'qty', 'price']) and any(k in norm_db for k in ['part', 'qty', 'price']):
-                    default_idx = j
-                    break
+            default_value = suggestions.get(db_c, "-- Skip --")
+            # If default_value is not present in csv_cols, fallback to "-- Skip --"
+            if default_value not in csv_cols:
+                default_index = 0
+            else:
+                default_index = csv_cols.index(default_value)
             with cols[i % group_count]:
-                mapping[db_c] = st.selectbox(f"DB: {db_c}", csv_cols, index=default_idx, key=f"map_{db_c}")
+                mapping[db_c] = st.selectbox(f"DB: {db_c}", csv_cols, index=default_index, key=f"map_{db_c}")
+
+        # Option: save current UI mapping as default for this filename before import
+        col1, col2 = st.columns([1,1])
+        with col1:
+            if st.button("Save mapping for this filename"):
+                # Build db->csv map from current UI and save
+                to_save = {db: sel for db, sel in mapping.items() if sel != "-- Skip --"}
+                mappings[file_key] = to_save
+                if save_mappings(mappings):
+                    st.success(f"Mapping saved for filename key: {file_key}")
+                else:
+                    st.error("Failed to save mapping.")
+
+        with col2:
+            if st.checkbox("Always prefer 'Qty After' style columns for quantity", value=PREFER_QTY_AFTER):
+                # Note: toggling here only affects session; to make permanent change edit PREFER_QTY_AFTER in file
+                st.info("Preference applied for this upload (session only).")
+
+        # Import action
         if st.button("🚀 START IMPORT", use_container_width=True):
             try:
+                # Build final_mapping: csv_col -> db_col
                 final_mapping = {v: k for k, v in mapping.items() if v != "-- Skip --"}
-                duplicates = {}
+
+                # Detect cases where there are multiple CSV columns mapping to same DB column
+                db_to_csv = {}
                 for csv_col, db_col in final_mapping.items():
-                    duplicates.setdefault(db_col, []).append(csv_col)
-                dupes = {db: srcs for db, srcs in duplicates.items() if len(srcs) > 1}
+                    db_to_csv.setdefault(db_col, []).append(csv_col)
+                dupes = {db: srcs for db, srcs in db_to_csv.items() if len(srcs) > 1}
+
                 if dupes:
-                    err_lines = []
+                    st.error("Mapping conflict detected: multiple CSV columns mapped to the same DB field.")
                     for db_col, srcs in dupes.items():
-                        err_lines.append(f"{db_col}: {', '.join(srcs)}")
-                    st.error("Mapping error — multiple CSV columns mapped to the same DB field:")
-                    for line in err_lines:
-                        st.write(f"- {line}")
-                    st.info("Option A: Fix the mapping above (select a single CSV column per DB field).")
-                    st.info("Option B: Auto-resolve duplicates (keep preferred column per DB field).")
+                        st.write(f"- {db_col}: {', '.join(srcs)}")
+                    st.info("You can fix the mapping above, or use Auto-resolve to pick a preferred column per DB field.")
+
                     if st.button("Auto-resolve duplicates (preferred heuristics)"):
                         resolved_db_to_csv = {}
                         for db_col, srcs in dupes.items():
                             preferred = choose_preferred(srcs, db_col)
                             resolved_db_to_csv[db_col] = preferred
-                        for csv_col, db_col in final_mapping.items():
+                        # keep other (non-duplicated) mappings too
+                        for db_col, srcs in db_to_csv.items():
                             if db_col not in resolved_db_to_csv:
-                                resolved_db_to_csv[db_col] = csv_col
+                                resolved_db_to_csv[db_col] = srcs[0]
+                        # rebuild final_mapping csv->db
                         final_mapping = {csv: db for db, csv in resolved_db_to_csv.items()}
+                        st.success("Auto-resolve applied.")
                     else:
                         st.stop()
+
+                # After resolution, build DataFrame and rename
                 csv_keys = list(final_mapping.keys())
                 if not csv_keys:
                     st.error("No CSV columns selected for import. Please map at least one column.")
                     st.stop()
+
+                # Build df_final using only chosen CSV columns (preserve column order)
                 df_final = df_raw[csv_keys].rename(columns=final_mapping)
-                st.write("Columns to be uploaded:", list(df_final.columns))
-                dupes_in_df = df_final.columns[df_final.columns.duplicated()].unique()
-                if len(dupes_in_df) > 0:
-                    st.error(f"Duplicate columns detected in final DataFrame: {list(dupes_in_df)}")
-                    st.stop()
+
+                # DEBUG: show columns BEFORE duplicate drop
+                st.write("Columns to be uploaded (before duplicate drop):", list(df_final.columns))
+
+                # If duplicate column names present in df_final, drop duplicate names (keep first)
+                if df_final.columns.duplicated().any():
+                    dup_names = list(df_final.columns[df_final.columns.duplicated()].unique())
+                    st.warning(f"Duplicate column names detected in final DataFrame: {dup_names}. Dropping duplicates (keeping first occurrence).")
+                    df_final = df_final.loc[:, ~df_final.columns.duplicated()]
+
+                # DEBUG: show columns AFTER duplicate drop
+                st.write("Columns to be uploaded (after duplicate drop):", list(df_final.columns))
+
+                # Sanity checks
                 if target_table == 'inventory' and 'part_number' not in df_final.columns:
                     st.error("Inventory import requires a 'part_number' mapping. Please map the Part Number column.")
                     st.stop()
+
+                # Persist mapping automatically on success (db_col -> csv_col)
+                persist_map = {v: k for k, v in final_mapping.items()}
+
+                # Write to DB
                 with engine.begin() as conn:
                     if page == "Initial Inventory Upload":
                         conn.execute(text("TRUNCATE TABLE inventory"))
                     df_final.to_sql(target_table, engine, if_exists='append', index=False, chunksize=10000)
+
                 st.success(f"Success! {len(df_final):,} rows imported into {target_table}.")
                 st.balloons()
+
+                # Save mapping for this filename (persist)
+                mappings[file_key] = persist_map
+                save_mappings(mappings)
+
             except Exception as e:
                 st.error(f"Import Error: {e}")
 
@@ -233,3 +373,4 @@ elif page == "⚠️ NUKE":
             conn.execute(text("TRUNCATE TABLE inventory"))
             conn.execute(text("TRUNCATE TABLE receiving_log"))
         st.success("System Wiped.")
+# -------------------------
