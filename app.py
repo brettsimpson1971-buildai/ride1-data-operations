@@ -45,7 +45,7 @@ def map_columns(df, target_cols):
     synonyms = {
         'part_number': ['part', 'part_no', 'part#', 'sku', 'item', 'item_number', 'partnum', 'part_number'],
         'location_bin': ['bin', 'bin_number', 'bin#', 'bin_no', 'location', 'loc'],
-        'quantity': ['qty', 'quantity_on_hand', 'on_hand', 'count', 'units', 'quantity'],
+        'quantity': ['qty', 'quantity_on_hand', 'on_hand', 'count', 'units', 'quantity', 'qty_after_adj'],
         'employee_id': ['emp', 'emp_id', 'user', 'employee', 'staff', 'tech'],
         'variance_amount': ['variance', 'diff', 'shrink', 'loss'],
         'severity_level': ['severity', 'status', 'priority'],
@@ -65,8 +65,10 @@ def map_columns(df, target_cols):
                     rename_map[orig] = target
                 break
     
+    # Rename the columns we found
     df = df.rename(columns=rename_map)
-    # Drop any columns that didn't get mapped to a DB column
+    
+    # CRITICAL: Keep ONLY the columns that now match the DB target_cols
     valid_cols = [c for c in df.columns if c in target_cols]
     return df[valid_cols]
 
@@ -192,4 +194,8 @@ elif page == "Initial Inventory Upload":
 elif page == "⚠️ NUKE":
     st.title("☢️ NUCLEAR RESET")
     st.error("⚠️ DANGER ZONE: This will permanently delete ALL inventory data.")
-    # ... (rest of nuke code remains same)
+    if st.button("CONFIRM TOTAL WIPE"):
+        with engine.begin() as conn:
+            conn.execute(text("TRUNCATE TABLE inventory"))
+            conn.execute(text("TRUNCATE TABLE receiving_log"))
+        st.success("System Wiped.")
