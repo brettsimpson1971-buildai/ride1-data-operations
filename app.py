@@ -89,9 +89,17 @@ elif page == "Master Inventory Upload":
     uploaded = st.file_uploader("Upload Master CSV", type="csv")
     if uploaded:
         df_raw = pd.read_csv(io.StringIO(uploaded.getvalue().decode('utf-8')), dtype=str)
+        
+        # --- CLEAN JUNK ROWS ---
+        # Drop rows where Part Number is '0', '1', or contains 'Supplier Code'
+        if 'Part Number' in df_raw.columns:
+            df_raw = df_raw[~df_raw['Part Number'].isin(['0', '1'])]
+            df_raw = df_raw[~df_raw['Part Number'].str.contains('Supplier Code', na=False)]
+
         with engine.connect() as conn:
             res = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='inventory'"))
             db_cols = [r[0] for r in res.fetchall() if r[0] not in ['id']]
+        
         st.write("### 🛠 Verify Column Mapping")
         suggestions = get_smart_mapping(list(df_raw.columns), db_cols)
         final_map = {}
@@ -102,23 +110,33 @@ elif page == "Master Inventory Upload":
             idx = csv_list.index(sugg) if sugg in csv_list else 0
             with cols[i % 3]:
                 final_map[db_c] = st.selectbox(f"DB: {db_c}", csv_list, index=idx)
-        if st.button("🚀 START 2M ROW IMPORT", use_container_width=True):
+        
+        if st.button("🚀 START BULLETPROOF IMPORT", use_container_width=True):
             try:
+                # 1. Prepare and Rename
                 rename_dict = {v: k for k, v in final_map.items() if v != "-- Skip --"}
                 df_import = df_raw[list(rename_dict.keys())].rename(columns=rename_dict)
+                
+                # 2. Deduplicate (Keep Last)
+                original_count = len(df_import)
+                df_import = df_import.drop_duplicates(subset=['part_number'], keep='last')
+                deduped_count = len(df_import)
+                
+                # 3. Clean numeric columns
                 num_cols = ['quantity', 'cost', 'price', 'margin', 'adj_qty', 'adj_amount', 'qty_after_adj']
                 for c in num_cols:
                     if c in df_import.columns:
                         df_import[c] = pd.to_numeric(df_import[c].str.replace('[$,]', '', regex=True), errors='coerce').fillna(0)
 
-                # TRUNCATE in its own committed transaction FIRST
+                # 4. TRUNCATE (Separate Transaction)
                 with engine.connect() as conn:
                     conn.execute(text("TRUNCATE TABLE inventory"))
                     conn.commit()
 
-                # INSERT in a completely separate fresh transaction
-                st.info(f"Streaming {len(df_import):,} rows to PostgreSQL...")
-                df_import.to_sql('inventory', engine, if_exists='append', index=False, chunksize=15000)
+                # 5. INSERT
+                st.info(f"Importing {deduped_count:,} unique SKUs (Dropped {original_count - deduped_count} duplicates)...")
+                df_import.to_sql('inventory', engine, if_exists='append', index=False, chunksize=10000)
+                
                 st.success(f"✅ Successfully imported {len(df_import):,} rows!")
                 st.balloons()
             except Exception as e:
@@ -134,7 +152,6 @@ elif page == "Daily Upload":
         st.dataframe(df_daily.head(20))
         if st.button("✅ CONFIRM DAILY IMPORT", use_container_width=True):
             try:
-                # TRUNCATE daily_log first in its own committed transaction
                 with engine.connect() as conn:
                     conn.execute(text("TRUNCATE TABLE daily_log"))
                     conn.commit()
@@ -150,7 +167,7 @@ elif page == "Leak Detector":
 elif page == "⚠️ NUKE":
     st.title("☢️ RESET")
     if st.button("WIPE ALL DATA"):
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             conn.execute(text("TRUNCATE TABLE inventory"))
             conn.commit()
         st.success("Inventory cleared.")
