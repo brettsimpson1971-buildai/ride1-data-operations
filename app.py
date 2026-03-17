@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
-import io, re
+import io, re, datetime
 
 # ---------- CONFIG ----------
 st.set_page_config(page_title="Ride 1 Command Center", layout="wide")
@@ -29,24 +29,10 @@ if not st.session_state["authenticated"]:
     login_screen()
     st.stop()
 
-# ---------- UTILITIES ----------
-def normalize_col(col):
-    s = str(col).strip().lower()
-    s = re.sub(r'[%#@\\\/&]', '_', s)
-    s = re.sub(r'[\s\-\u2013]+', '_', s)
-    s = re.sub(r'[^a-z0-9_]', '', s)
-    return s.strip('_')
-
 # ---------- SIDEBAR ----------
 with st.sidebar:
     st.image("https://assets.zyrosite.com/46uOcFMIrXbOQmGo/logo.png-354IavGq7CUmvHlz.png", width=200)
-    page = st.radio("Navigation", [
-        "Command Center",
-        "Master Inventory Upload",
-        "Daily Upload",
-        "Leak Detector",
-        "⚠️ NUKE"
-    ])
+    page = st.radio("Navigation", ["Command Center", "Master Inventory Upload", "Daily Upload", "Leak Detector", "⚠️ NUKE"])
     if st.button("Logout"):
         st.session_state["authenticated"] = False
         st.rerun()
@@ -56,7 +42,7 @@ if page == "Command Center":
     st.title("🚨 RIDE 1 | FORENSIC COMMAND CENTER")
     sku = pd.read_sql("SELECT COUNT(*) FROM inventory", engine).iloc[0,0]
     st.metric("Total SKUs in Database", f"{int(sku):,}")
-    st.info("System ready. Use sidebar to upload inventory or daily logs.")
+    st.info("System ready. Monitoring 222k+ records for margin leaks.")
 
 elif page == "Master Inventory Upload":
     st.title("📥 Master Inventory Upload")
@@ -67,7 +53,6 @@ elif page == "Master Inventory Upload":
             res = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='inventory'"))
             db_cols = [r[0] for r in res.fetchall() if r[0] not in ['id']]
         
-        # Mapping logic (simplified for brevity, same as before)
         st.write("### 🛠 Verify Column Mapping")
         final_map = {}
         cols = st.columns(3)
@@ -80,13 +65,10 @@ elif page == "Master Inventory Upload":
                 rename_dict = {v: k for k, v in final_map.items() if v != "-- Skip --"}
                 df_import = df_raw[list(rename_dict.keys())].rename(columns=rename_dict)
                 df_import = df_import.drop_duplicates(subset=['part_number'], keep='last')
-                
-                # Clean numbers
                 num_cols = ['quantity', 'cost', 'price', 'margin', 'adj_qty', 'adj_amount', 'qty_after_adj']
                 for c in num_cols:
                     if c in df_import.columns:
                         df_import[c] = pd.to_numeric(df_import[c].str.replace('[$,]', '', regex=True), errors='coerce').fillna(0)
-
                 with engine.connect() as conn:
                     conn.execute(text("TRUNCATE TABLE inventory"))
                     conn.commit()
@@ -102,7 +84,6 @@ elif page == "Daily Upload":
         df_daily = pd.read_csv(io.StringIO(daily_file.getvalue().decode('utf-8')), dtype=str)
         if st.button("✅ CONFIRM DAILY IMPORT"):
             try:
-                # We DON'T truncate here anymore, we APPEND so we have history
                 df_daily.to_sql('daily_log', engine, if_exists='append', index=False)
                 st.success("✅ Daily log added to history!")
             except Exception as e:
@@ -111,30 +92,61 @@ elif page == "Daily Upload":
 elif page == "Leak Detector":
     st.title("🔍 Forensic Leak Detector")
     
-    # 1. Show High-Level Discrepancies
+    # Query to find discrepancies that ARE NOT resolved
     query = """
     SELECT 
         d."Part Number" as part_number,
-        COUNT(*) as instances,
-        MAX(d.created_at) as last_seen
+        d."Description" as description,
+        d."Cost" as daily_cost,
+        i.cost as master_cost,
+        d."Price" as daily_price,
+        i.price as master_price,
+        d."Adj Qty" as adj_qty,
+        d.created_at
     FROM daily_log d
     JOIN inventory i ON d."Part Number" = i.part_number
-    GROUP BY d."Part Number"
-    ORDER BY last_seen DESC
+    LEFT JOIN leak_cases c ON d."Part Number" = c.part_number AND c.status = 'resolved'
+    WHERE c.part_number IS NULL
+    AND (
+        ABS(CAST(REPLACE(REPLACE(d."Cost", '$', ''), ',', '') AS NUMERIC) - i.cost) > 0.01
+        OR ABS(CAST(REPLACE(REPLACE(d."Price", '$', ''), ',', '') AS NUMERIC) - i.price) > 0.01
+        OR CAST(REPLACE(REPLACE(d."Adj Qty", '$', ''), ',', '') AS NUMERIC) < 0
+    )
+    ORDER BY d.created_at DESC
     """
+    
     leaks = pd.read_sql(query, engine)
     
     if not leaks.empty:
-        st.subheader("Suspect Parts Found")
-        selected_part = st.selectbox("Select a Part Number to Drill Down:", leaks['part_number'])
+        def color_leaks(row):
+            cost_diff = abs(float(str(row['daily_cost']).replace('$','').replace(',','')) - float(row['master_cost']))
+            adj = float(str(row['adj_qty']).replace('$','').replace(',',''))
+            if adj < 0 or cost_diff > 50: return ['background-color: #ff4b4b; color: white'] * len(row) # RED
+            if cost_diff > 5: return ['background-color: #ffa500; color: black'] * len(row) # YELLOW
+            return [''] * len(row)
+
+        st.subheader("🚨 Active Discrepancies")
+        st.dataframe(leaks.style.apply(color_leaks, axis=1), use_container_width=True)
         
-        if selected_part:
-            st.write(f"### 🕵️‍♂️ History for {selected_part}")
-            history_query = text("SELECT * FROM daily_log WHERE \"Part Number\" = :p ORDER BY created_at DESC")
-            history_df = pd.read_sql(history_query, engine, params={"p": selected_part})
-            st.table(history_df)
+        selected_part = st.selectbox("Select Part to Investigate & Resolve:", ["-- Select --"] + list(leaks['part_number'].unique()))
+        
+        if selected_part != "-- Select --":
+            st.divider()
+            st.write(f"### 🕵️‍♂️ Case File: {selected_part}")
+            
+            # Show History
+            hist = pd.read_sql(text("SELECT * FROM daily_log WHERE \"Part Number\" = :p ORDER BY created_at DESC"), engine, params={"p": selected_part})
+            st.write("**Full Transaction History:**")
+            st.table(hist)
+            
+            if st.button(f"✅ Mark {selected_part} as Resolved", use_container_width=True):
+                with engine.connect() as conn:
+                    conn.execute(text("INSERT INTO leak_cases (part_number, status, resolved_at) VALUES (:p, 'resolved', NOW())"), {"p": selected_part})
+                    conn.commit()
+                st.success(f"Case {selected_part} resolved and archived.")
+                st.rerun()
     else:
-        st.info("No discrepancies found in history.")
+        st.success("✅ No active leaks detected. All records match.")
 
 elif page == "⚠️ NUKE":
     st.title("☢️ RESET")
@@ -142,5 +154,6 @@ elif page == "⚠️ NUKE":
         with engine.connect() as conn:
             conn.execute(text("TRUNCATE TABLE inventory"))
             conn.execute(text("TRUNCATE TABLE daily_log"))
+            conn.execute(text("TRUNCATE TABLE leak_cases"))
             conn.commit()
         st.success("System Reset.")
