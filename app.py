@@ -110,9 +110,15 @@ elif page == "Master Inventory Upload":
                 for c in num_cols:
                     if c in df_import.columns:
                         df_import[c] = pd.to_numeric(df_import[c].str.replace('[$,]', '', regex=True), errors='coerce').fillna(0)
-                with engine.begin() as conn:
+
+                # TRUNCATE in its own committed transaction FIRST
+                with engine.connect() as conn:
                     conn.execute(text("TRUNCATE TABLE inventory"))
-                    df_import.to_sql('inventory', engine, if_exists='append', index=False, chunksize=15000)
+                    conn.commit()
+
+                # INSERT in a completely separate fresh transaction
+                st.info(f"Streaming {len(df_import):,} rows to PostgreSQL...")
+                df_import.to_sql('inventory', engine, if_exists='append', index=False, chunksize=15000)
                 st.success(f"✅ Successfully imported {len(df_import):,} rows!")
                 st.balloons()
             except Exception as e:
@@ -128,8 +134,11 @@ elif page == "Daily Upload":
         st.dataframe(df_daily.head(20))
         if st.button("✅ CONFIRM DAILY IMPORT", use_container_width=True):
             try:
-                with engine.begin() as conn:
-                    df_daily.to_sql('daily_log', engine, if_exists='append', index=False, chunksize=5000)
+                # TRUNCATE daily_log first in its own committed transaction
+                with engine.connect() as conn:
+                    conn.execute(text("TRUNCATE TABLE daily_log"))
+                    conn.commit()
+                df_daily.to_sql('daily_log', engine, if_exists='append', index=False, chunksize=5000)
                 st.success(f"✅ Daily log imported — {len(df_daily):,} rows added!")
             except Exception as e:
                 st.error(f"Daily Import Failed: {e}")
@@ -141,6 +150,7 @@ elif page == "Leak Detector":
 elif page == "⚠️ NUKE":
     st.title("☢️ RESET")
     if st.button("WIPE ALL DATA"):
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             conn.execute(text("TRUNCATE TABLE inventory"))
+            conn.commit()
         st.success("Inventory cleared.")
