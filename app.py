@@ -89,17 +89,12 @@ elif page == "Master Inventory Upload":
     uploaded = st.file_uploader("Upload Master CSV", type="csv")
     if uploaded:
         df_raw = pd.read_csv(io.StringIO(uploaded.getvalue().decode('utf-8')), dtype=str)
-        
-        # --- CLEAN JUNK ROWS ---
-        # Drop rows where Part Number is '0', '1', or contains 'Supplier Code'
         if 'Part Number' in df_raw.columns:
             df_raw = df_raw[~df_raw['Part Number'].isin(['0', '1'])]
             df_raw = df_raw[~df_raw['Part Number'].str.contains('Supplier Code', na=False)]
-
         with engine.connect() as conn:
             res = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='inventory'"))
             db_cols = [r[0] for r in res.fetchall() if r[0] not in ['id']]
-        
         st.write("### 🛠 Verify Column Mapping")
         suggestions = get_smart_mapping(list(df_raw.columns), db_cols)
         final_map = {}
@@ -110,33 +105,22 @@ elif page == "Master Inventory Upload":
             idx = csv_list.index(sugg) if sugg in csv_list else 0
             with cols[i % 3]:
                 final_map[db_c] = st.selectbox(f"DB: {db_c}", csv_list, index=idx)
-        
         if st.button("🚀 START BULLETPROOF IMPORT", use_container_width=True):
             try:
-                # 1. Prepare and Rename
                 rename_dict = {v: k for k, v in final_map.items() if v != "-- Skip --"}
                 df_import = df_raw[list(rename_dict.keys())].rename(columns=rename_dict)
-                
-                # 2. Deduplicate (Keep Last)
                 original_count = len(df_import)
                 df_import = df_import.drop_duplicates(subset=['part_number'], keep='last')
                 deduped_count = len(df_import)
-                
-                # 3. Clean numeric columns
                 num_cols = ['quantity', 'cost', 'price', 'margin', 'adj_qty', 'adj_amount', 'qty_after_adj']
                 for c in num_cols:
                     if c in df_import.columns:
                         df_import[c] = pd.to_numeric(df_import[c].str.replace('[$,]', '', regex=True), errors='coerce').fillna(0)
-
-                # 4. TRUNCATE (Separate Transaction)
                 with engine.connect() as conn:
                     conn.execute(text("TRUNCATE TABLE inventory"))
                     conn.commit()
-
-                # 5. INSERT
                 st.info(f"Importing {deduped_count:,} unique SKUs (Dropped {original_count - deduped_count} duplicates)...")
                 df_import.to_sql('inventory', engine, if_exists='append', index=False, chunksize=10000)
-                
                 st.success(f"✅ Successfully imported {len(df_import):,} rows!")
                 st.balloons()
             except Exception as e:
@@ -162,12 +146,41 @@ elif page == "Daily Upload":
 
 elif page == "Leak Detector":
     st.title("🔍 Leak Detector")
-    st.info("Coming soon — cross-reference daily logs against master inventory to find discrepancies.")
+    st.write("Comparing Daily Receiving Log against Master Inventory...")
+    
+    query = """
+    SELECT 
+        d."Part Number" as part_number,
+        d."Description" as description,
+        d."Cost" as daily_cost,
+        i.cost as master_cost,
+        d."Price" as daily_price,
+        i.price as master_price,
+        (CAST(REPLACE(REPLACE(d."Cost", '$', ''), ',', '') AS NUMERIC) - i.cost) as cost_diff,
+        (CAST(REPLACE(REPLACE(d."Price", '$', ''), ',', '') AS NUMERIC) - i.price) as price_diff
+    FROM daily_log d
+    JOIN inventory i ON d."Part Number" = i.part_number
+    WHERE 
+        ABS(CAST(REPLACE(REPLACE(d."Cost", '$', ''), ',', '') AS NUMERIC) - i.cost) > 0.01
+        OR ABS(CAST(REPLACE(REPLACE(d."Price", '$', ''), ',', '') AS NUMERIC) - i.price) > 0.01
+    """
+    
+    try:
+        leaks = pd.read_sql(query, engine)
+        if len(leaks) > 0:
+            st.warning(f"⚠️ Found {len(leaks)} Price/Cost Discrepancies!")
+            st.dataframe(leaks.style.highlight_max(axis=0, subset=['cost_diff'], color='red'))
+        else:
+            st.success("✅ No leaks detected. All daily prices match master inventory.")
+    except Exception as e:
+        st.error(f"Leak Detection Error: {e}")
+        st.info("Make sure you have uploaded a Daily Log first.")
 
 elif page == "⚠️ NUKE":
     st.title("☢️ RESET")
     if st.button("WIPE ALL DATA"):
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             conn.execute(text("TRUNCATE TABLE inventory"))
+            conn.execute(text("TRUNCATE TABLE daily_log"))
             conn.commit()
-        st.success("Inventory cleared.")
+        st.success("All tables cleared.")
