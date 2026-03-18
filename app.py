@@ -29,6 +29,24 @@ if not st.session_state["authenticated"]:
     login_screen()
     st.stop()
 
+# ---------- SMART MAPPING ----------
+def get_shawn_mapping(csv_cols):
+    logic = {
+        'part_number': ['Part Number', 'part_number', 'SKU'],
+        'description': ['Description', 'description'],
+        'quantity': ['Qty', 'Quantity', 'quantity'],
+        'price': ['Price', 'price'],
+        'cost': ['Cost', 'cost'],
+        'tx_type': ['Tx Type', 'Transaction Type', 'Type'],
+        'user_name': ['User', 'Employee', 'user_name'],
+        'location': ['Location', 'Store', 'location']
+    }
+    mapping = {}
+    for db_col, variants in logic.items():
+        match = next((c for c in csv_cols if c in variants), "-- Skip --")
+        mapping[db_col] = match
+    return mapping
+
 # ---------- SIDEBAR ----------
 with st.sidebar:
     st.image("https://assets.zyrosite.com/46uOcFMIrXbOQmGo/logo.png-354IavGq7CUmvHlz.png", width=200)
@@ -40,49 +58,44 @@ with st.sidebar:
 # ---------- PAGES ----------
 if page == "Command Center":
     st.title("🚨 RIDE 1 | FORENSIC COMMAND CENTER")
-    
     col1, col2 = st.columns(2)
     with col1:
         sku = pd.read_sql("SELECT COUNT(*) FROM inventory", engine).iloc[0,0]
         st.metric("Total SKUs in Database", f"{int(sku):,}")
-    
     with col2:
-        # THIS IS YOUR ROI TRACKER
         savings = pd.read_sql("SELECT SUM(recovered_amount) FROM leak_cases", engine).iloc[0,0] or 0
-        st.metric("Total Zaptask Savings", f"${float(savings):,.2f}", delta="Recovered Revenue", delta_color="normal")
-    
-    st.divider()
-    st.info("System ready. Monitoring 222k+ records for margin leaks.")
+        st.metric("Total Zaptask Savings", f"${float(savings):,.2f}")
+    st.info("System ready. Monitoring Sales, Shipping, and Receiving.")
 
 elif page == "Master Inventory Upload":
     st.title("📥 Master Inventory Upload")
     uploaded = st.file_uploader("Upload Master CSV", type="csv")
     if uploaded:
         df_raw = pd.read_csv(io.StringIO(uploaded.getvalue().decode('utf-8')), dtype=str)
-        if 'Part Number' in df_raw.columns:
-            df_raw = df_raw[~df_raw['Part Number'].isin(['0', '1', 'nan', None])]
-            df_raw = df_raw[~df_raw['Part Number'].str.contains('Supplier Code', na=False)]
-
-        with engine.connect() as conn:
-            res = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='inventory'"))
-            db_cols = [r[0] for r in res.fetchall() if r[0] not in ['id']]
+        # Clean junk
+        df_raw = df_raw[~df_raw['Part Number'].isin(['0', '1', 'nan', None])]
         
         st.write("### 🛠 Verify Column Mapping")
+        auto_map = get_shawn_mapping(list(df_raw.columns))
         final_map = {}
         cols = st.columns(3)
-        for i, db_c in enumerate(db_cols):
+        for i, db_c in enumerate(auto_map.keys()):
+            csv_list = ["-- Skip --"] + list(df_raw.columns)
+            idx = csv_list.index(auto_map[db_c]) if auto_map[db_c] in csv_list else 0
             with cols[i % 3]:
-                final_map[db_c] = st.selectbox(f"DB: {db_c}", ["-- Skip --"] + list(df_raw.columns))
+                final_map[db_c] = st.selectbox(f"DB: {db_c}", csv_list, index=idx)
 
-        if st.button("🚀 START IMPORT"):
+        if st.button("🚀 START MASTER IMPORT"):
             try:
                 rename_dict = {v: k for k, v in final_map.items() if v != "-- Skip --"}
                 df_import = df_raw[list(rename_dict.keys())].rename(columns=rename_dict)
                 df_import = df_import.drop_duplicates(subset=['part_number'], keep='last')
-                num_cols = ['quantity', 'cost', 'price', 'margin', 'adj_qty', 'adj_amount', 'qty_after_adj']
-                for c in num_cols:
+                
+                # Numeric cleaning
+                for c in ['quantity', 'cost', 'price']:
                     if c in df_import.columns:
                         df_import[c] = pd.to_numeric(df_import[c].str.replace('[$,]', '', regex=True), errors='coerce').fillna(0)
+                
                 with engine.connect() as conn:
                     conn.execute(text("TRUNCATE TABLE inventory"))
                     conn.commit()
@@ -92,34 +105,50 @@ elif page == "Master Inventory Upload":
                 st.error(f"Error: {e}")
 
 elif page == "Daily Upload":
-    st.title("📋 Daily Upload")
-    daily_file = st.file_uploader("Upload Daily CSV", type="csv")
+    st.title("📋 Daily Transaction Upload")
+    st.write("Upload Sales, Shipping, and Receiving logs here.")
+    daily_file = st.file_uploader("Upload Combined CSV", type="csv")
     if daily_file:
         df_daily = pd.read_csv(io.StringIO(daily_file.getvalue().decode('utf-8')), dtype=str)
+        auto_map = get_shawn_mapping(list(df_daily.columns))
+        
+        st.write("### 🛠 Verify Daily Mapping")
+        final_map = {}
+        cols = st.columns(3)
+        for i, db_c in enumerate(auto_map.keys()):
+            csv_list = ["-- Skip --"] + list(df_daily.columns)
+            idx = csv_list.index(auto_map[db_c]) if auto_map[db_c] in csv_list else 0
+            with cols[i % 3]:
+                final_map[db_c] = st.selectbox(f"Daily: {db_c}", csv_list, index=idx)
+
         if st.button("✅ CONFIRM DAILY IMPORT"):
             try:
-                df_daily.to_sql('daily_log', engine, if_exists='append', index=False)
-                st.success("✅ Daily log added to history!")
+                rename_dict = {v: k for k, v in final_map.items() if v != "-- Skip --"}
+                df_import = df_daily[list(rename_dict.keys())].rename(columns=rename_dict)
+                # We APPEND here to keep history
+                df_import.to_sql('daily_log', engine, if_exists='append', index=False)
+                st.success(f"✅ {len(df_import)} transactions added to history!")
             except Exception as e:
                 st.error(f"Error: {e}")
 
 elif page == "Leak Detector":
     st.title("🔍 Forensic Leak Detector")
     
+    # Advanced Query: Checks Sales vs Price and Receiving vs Cost
     query = """
     SELECT 
-        d."Part Number" as part_number, d."Description" as description,
-        d."Cost" as daily_cost, i.cost as master_cost,
-        d."Price" as daily_price, i.price as master_price,
-        d."Qty" as daily_qty, d."Adj Qty" as adj_qty, d.created_at
+        d.part_number, d.description, d.tx_type,
+        d.cost as daily_cost, i.cost as master_cost,
+        d.price as daily_price, i.price as master_price,
+        d.quantity as daily_qty, d.user_name, d.created_at
     FROM daily_log d
-    JOIN inventory i ON d."Part Number" = i.part_number
-    LEFT JOIN leak_cases c ON d."Part Number" = c.part_number AND c.status = 'resolved'
+    JOIN inventory i ON d.part_number = i.part_number
+    LEFT JOIN leak_cases c ON d.part_number = c.part_number AND c.status = 'resolved'
     WHERE c.part_number IS NULL
     AND (
-        ABS(CAST(REPLACE(REPLACE(d."Cost", '$', ''), ',', '') AS NUMERIC) - i.cost) > 0.01
-        OR ABS(CAST(REPLACE(REPLACE(d."Price", '$', ''), ',', '') AS NUMERIC) - i.price) > 0.01
-        OR CAST(REPLACE(REPLACE(d."Adj Qty", '$', ''), ',', '') AS NUMERIC) < 0
+        (d.tx_type = 'receive' AND ABS(CAST(d.cost AS NUMERIC) - i.cost) > 0.01)
+        OR (d.tx_type = 'sale' AND CAST(d.price AS NUMERIC) < i.price)
+        OR (d.tx_type = 'adjust' AND CAST(d.quantity AS NUMERIC) < 0)
     )
     ORDER BY d.created_at DESC
     """
@@ -128,12 +157,9 @@ elif page == "Leak Detector":
     if not leaks.empty:
         def color_leaks(row):
             try:
-                d_cost = float(str(row['daily_cost']).replace('$','').replace(',',''))
-                m_cost = float(row['master_cost'])
-                cost_diff = abs(d_cost - m_cost)
-                adj = float(str(row['adj_qty']).replace('$','').replace(',',''))
-                if adj < 0 or cost_diff > 50: return ['background-color: #ff4b4b; color: white; font-weight: bold'] * len(row)
-                if cost_diff > 5: return ['background-color: #ffa500; color: black'] * len(row)
+                if row['tx_type'] == 'adjust': return ['background-color: #ff4b4b; color: white'] * len(row)
+                if row['tx_type'] == 'sale' and float(row['daily_price']) < float(row['master_price']):
+                    return ['background-color: #ffa500; color: black'] * len(row)
             except: pass
             return [''] * len(row)
 
@@ -141,37 +167,29 @@ elif page == "Leak Detector":
         st.dataframe(leaks.style.apply(color_leaks, axis=1), use_container_width=True)
         
         st.divider()
-        selected_part = st.selectbox("🔍 Select a Part Number to Investigate:", ["-- Select --"] + list(leaks['part_number'].unique()))
+        selected_part = st.selectbox("🔍 Select Part to Investigate:", ["-- Select --"] + list(leaks['part_number'].unique()))
         
         if selected_part != "-- Select --":
             col_a, col_b = st.columns([2,1])
-            
-            # Get the specific leak data for calculation
             row = leaks[leaks['part_number'] == selected_part].iloc[0]
-            d_cost = float(str(row['daily_cost']).replace('$','').replace(',',''))
-            m_cost = float(row['master_cost'])
-            d_price = float(str(row['daily_price']).replace('$','').replace(',',''))
-            m_price = float(row['master_price'])
-            qty = float(str(row['daily_qty']).replace('$','').replace(',','')) if row['daily_qty'] else 1
             
-            # Calculate the "Win"
-            cost_leak = max(0, (d_cost - m_cost) * qty)
-            price_leak = max(0, (m_price - d_price) * qty)
-            total_win = cost_leak + price_leak
+            # Calculate Recovery
+            qty = float(row['daily_qty']) if row['daily_qty'] else 1
+            recovery = abs(float(row['daily_price']) - float(row['master_price'])) * abs(qty)
 
             with col_a:
                 st.write(f"### 🕵️‍♂️ Case File: {selected_part}")
-                hist = pd.read_sql(text("SELECT * FROM daily_log WHERE \"Part Number\" = :p ORDER BY created_at DESC"), engine, params={"p": selected_part})
+                hist = pd.read_sql(text("SELECT * FROM daily_log WHERE part_number = :p ORDER BY created_at DESC"), engine, params={"p": selected_part})
                 st.dataframe(hist, use_container_width=True)
             
             with col_b:
                 st.write("### 🛠 Actions")
-                st.metric("Potential Recovery", f"${total_win:,.2f}")
+                st.metric("Potential Recovery", f"${recovery:,.2f}")
                 if st.button(f"✅ Resolve & Bank Savings", use_container_width=True):
                     with engine.connect() as conn:
-                        conn.execute(text("INSERT INTO leak_cases (part_number, status, resolved_at, recovered_amount) VALUES (:p, 'resolved', NOW(), :s)"), {"p": selected_part, "s": total_win})
+                        conn.execute(text("INSERT INTO leak_cases (part_number, status, resolved_at, recovered_amount) VALUES (:p, 'resolved', NOW(), :s)"), {"p": selected_part, "s": recovery})
                         conn.commit()
-                    st.success(f"Case {selected_part} resolved! ${total_win:,.2f} added to Zaptask Savings.")
+                    st.success("Case resolved!")
                     st.rerun()
     else:
         st.success("✅ No active leaks detected.")
