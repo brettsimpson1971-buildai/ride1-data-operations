@@ -47,7 +47,7 @@ def smart_map(df, target_table):
     # Dictionary of common Lightspeed synonyms
     synonyms = {
         'part_number': ['part', 'part_no', 'part#', 'sku', 'item', 'partnum', 'part_number'],
-        'quantity': ['qty', 'qoh', 'quantity_on_hand', 'count', 'units', 'on_hand'],
+        'quantity': ['qty', 'qoh', 'quantity_on_hand', 'count', 'units', 'on_hand', 'quantity'],
         'price': ['price', 'msrp', 'retail', 'sell_price'],
         'cost': ['cost', 'unit_cost', 'net_price'],
         'description': ['description', 'desc', 'item_name'],
@@ -65,16 +65,20 @@ def smart_map(df, target_table):
     
     df = df.rename(columns=rename_map)
     
-    # Ensure all DB columns exist in the dataframe (Fixes the crash from your screenshot)
+    # ✅ CRITICAL FIX: Force 'qty' to 'quantity' to match your existing DB schema
+    if 'qty' in df.columns and 'quantity' not in df.columns:
+        df = df.rename(columns={'qty': 'quantity'})
+    
+    # Ensure all DB columns exist in the dataframe (Fixes the crash from missing columns)
     for col in db_cols:
         if col not in df.columns:
             df[col] = 0 if col in ['quantity', 'cost', 'price', 'adj_qty', 'adj_amount'] else None
             
-    # Clean numeric columns (Remove $ and ,)
+    # Clean numeric columns (Remove $, %, and commas)
     num_cols = ['quantity', 'cost', 'price', 'margin', 'adj_qty', 'adj_amount', 'qty_after_adj']
     for c in num_cols:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace('[$,]', '', regex=True), errors='coerce').fillna(0)
+            df[c] = pd.to_numeric(df[c].astype(str).str.replace('[$,%]', '', regex=True), errors='coerce').fillna(0)
             
     return df[db_cols]
 
@@ -108,15 +112,16 @@ elif page == "Master Inventory Upload":
     uploaded = st.file_uploader("Upload Master CSV", type="csv")
     if uploaded and st.button("🚀 START MASTER IMPORT"):
         try:
-            # Streamed processing for large files
             with engine.begin() as conn:
                 conn.execute(text("TRUNCATE TABLE inventory"))
             
+            # Streamed processing for large files
             for chunk in pd.read_csv(io.StringIO(uploaded.getvalue().decode('utf-8', errors='ignore')), chunksize=50000):
                 chunk_mapped = smart_map(chunk, 'inventory')
                 chunk_mapped.to_sql('inventory', engine, if_exists='append', index=False)
             
             st.success("✅ Master Inventory Updated Successfully!")
+            st.rerun()
         except Exception as e:
             st.error(f"Master Upload Error: {e}")
 
@@ -130,14 +135,13 @@ elif page == "Daily Upload":
             # Smart Map handles missing columns like "Adj Qty" automatically
             df_mapped = smart_map(df_daily, 'daily_log')
             df_mapped.to_sql('daily_log', engine, if_exists='append', index=False)
-            st.success("✅ Daily log added to history! Check Leak Detector for results.")
+            st.success("✅ Daily log added successfully! Check Leak Detector for results.")
         except Exception as e:
             st.error(f"Daily Upload Error: {e}")
 
 elif page == "Leak Detector":
     st.title("🔍 Forensic Leak Detector")
     
-    # This query looks for price/cost changes or negative adjustments
     query = """
     SELECT 
         d.part_number, d.description,
